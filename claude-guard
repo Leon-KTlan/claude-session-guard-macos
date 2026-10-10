@@ -1,0 +1,237 @@
+#!/bin/zsh
+
+set -u
+set -o pipefail
+
+readonly PROGRAM_NAME="claude-guard"
+readonly DEFAULT_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-session-guard/config"
+readonly CONFIG_FILE="${CLAUDE_GUARD_CONFIG:-$DEFAULT_CONFIG_FILE}"
+readonly EXIT_CHECK_URL="https://claude.ai/cdn-cgi/trace"
+
+CLASH_HOST="${CLASH_HOST:-127.0.0.1}"
+CLASH_PORT="${CLASH_PORT:-7897}"
+EXPECTED_EXIT_IP="${EXPECTED_EXIT_IP:-}"
+EXPECTED_COUNTRY="${EXPECTED_COUNTRY:-}"
+
+usage() {
+  cat <<'EOF'
+Usage: claude-guard <command>
+
+Commands:
+  start          Verify Clash and the pinned exit, then open Claude Desktop.
+  stop           Gracefully quit Claude Desktop and stop the user's Claude CLI.
+  clean          Safe alias for stop; does not delete cookies, logs, or evidence.
+  check          Verify Clash, Vortex state, and the Claude-visible exit.
+  status         Show Claude process state and run the network checks.
+  help           Show this help.
+
+Environment overrides:
+  EXPECTED_EXIT_IP, EXPECTED_COUNTRY, CLASH_HOST, CLASH_PORT,
+  CLAUDE_GUARD_CONFIG
+EOF
+}
+
+load_config() {
+  [[ -r "$CONFIG_FILE" ]] || return 0
+
+  local key value
+  while IFS='=' read -r key value; do
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    value="${value%\"}"
+    value="${value#\"}"
+    case "$key" in
+      CLASH_HOST) [[ "$CLASH_HOST" == "127.0.0.1" ]] && CLASH_HOST="$value" ;;
+      CLASH_PORT) [[ "$CLASH_PORT" == "7897" ]] && CLASH_PORT="$value" ;;
+      EXPECTED_EXIT_IP) [[ -z "$EXPECTED_EXIT_IP" ]] && EXPECTED_EXIT_IP="$value" ;;
+      EXPECTED_COUNTRY) [[ -z "$EXPECTED_COUNTRY" ]] && EXPECTED_COUNTRY="$value" ;;
+    esac
+  done < "$CONFIG_FILE"
+}
+
+desktop_running() {
+  pgrep -u "$(id -u)" -x Claude >/dev/null 2>&1 || \
+    pgrep -u "$(id -u)" -f '/Applications/Claude\.app/Contents/' >/dev/null 2>&1
+}
+
+cli_running() {
+  pgrep -u "$(id -u)" -x claude >/dev/null 2>&1
+}
+
+vortex_running() {
+  pgrep -f '/com\.vortex\.helper($|/)|/com\.vortex\.helper ' >/dev/null 2>&1
+}
+
+clash_running() {
+  pgrep -f '/clash-verge|/verge-mihomo' >/dev/null 2>&1
+}
+
+fetch_explicit_proxy_trace() {
+  curl --silent --show-error --fail \
+    --connect-timeout 5 --max-time 15 \
+    --proxy "http://${CLASH_HOST}:${CLASH_PORT}" \
+    "$EXIT_CHECK_URL"
+}
+
+fetch_tun_trace() {
+  curl --silent --show-error --fail \
+    --connect-timeout 5 --max-time 15 \
+    --noproxy '*' \
+    "$EXIT_CHECK_URL"
+}
+
+network_check() {
+  local failed=0 proxy_trace tun_trace proxy_ip tun_ip tun_country
+
+  if vortex_running; then
+    print -u2 -- "[FAIL] Vortex helper is running; it may compete with Clash."
+    failed=1
+  else
+    print -- "[ OK ] Vortex helper is not running."
+  fi
+
+  if ! clash_running; then
+    print -u2 -- "[FAIL] Clash Verge/Mihomo is not running."
+    failed=1
+  else
+    print -- "[ OK ] Clash Verge/Mihomo is running."
+  fi
+
+  if ! nc -G 2 -z "$CLASH_HOST" "$CLASH_PORT" >/dev/null 2>&1; then
+    print -u2 -- "[FAIL] Clash port ${CLASH_HOST}:${CLASH_PORT} is unavailable."
+    return 1
+  fi
+  print -- "[ OK ] Clash port ${CLASH_HOST}:${CLASH_PORT} is available."
+
+  if [[ -z "$EXPECTED_EXIT_IP" ]]; then
+    print -u2 -- "[FAIL] EXPECTED_EXIT_IP is not pinned in $CONFIG_FILE."
+    return 1
+  fi
+
+  if ! proxy_trace="$(fetch_explicit_proxy_trace 2>&1)"; then
+    print -u2 -- "[FAIL] Could not reach Claude through explicit Clash proxy: $proxy_trace"
+    return 1
+  fi
+
+  if ! tun_trace="$(fetch_tun_trace 2>&1)"; then
+    print -u2 -- "[FAIL] Could not reach Claude through the normal TUN/system path: $tun_trace"
+    return 1
+  fi
+
+  proxy_ip="$(print -r -- "$proxy_trace" | awk -F= '$1 == "ip" { print $2; exit }')"
+  tun_ip="$(print -r -- "$tun_trace" | awk -F= '$1 == "ip" { print $2; exit }')"
+  tun_country="$(print -r -- "$tun_trace" | awk -F= '$1 == "loc" { print $2; exit }')"
+
+  if [[ -z "$proxy_ip" || -z "$tun_ip" ]]; then
+    print -u2 -- "[FAIL] Claude trace did not return both exit IPs."
+    return 1
+  fi
+
+  if [[ "$proxy_ip" != "$EXPECTED_EXIT_IP" ]]; then
+    print -u2 -- "[FAIL] Explicit-proxy exit changed: expected $EXPECTED_EXIT_IP, got $proxy_ip."
+    failed=1
+  else
+    print -- "[ OK ] Explicit-proxy exit is pinned: $proxy_ip."
+  fi
+
+  if [[ "$tun_ip" != "$EXPECTED_EXIT_IP" ]]; then
+    print -u2 -- "[FAIL] TUN/system exit changed: expected $EXPECTED_EXIT_IP, got $tun_ip."
+    failed=1
+  else
+    print -- "[ OK ] TUN/system exit is pinned: $tun_ip."
+  fi
+
+  if [[ -n "$EXPECTED_COUNTRY" && "$tun_country" != "$EXPECTED_COUNTRY" ]]; then
+    print -u2 -- "[FAIL] Exit country changed: expected $EXPECTED_COUNTRY, got ${tun_country:-unknown}."
+    failed=1
+  elif [[ -n "$EXPECTED_COUNTRY" ]]; then
+    print -- "[ OK ] Claude-visible country is $tun_country."
+  else
+    print -- "[INFO] Claude-visible country is ${tun_country:-unknown}; no country is pinned."
+  fi
+
+  return "$failed"
+}
+
+start_claude() {
+  if ! network_check; then
+    print -u2 -- "[BLOCKED] Claude was not opened because the route is not stable."
+    return 1
+  fi
+
+  if desktop_running; then
+    print -- "[INFO] Claude Desktop is already running."
+    return 0
+  fi
+
+  open -a Claude
+  print -- "[ OK ] Claude Desktop opened after the route check passed."
+}
+
+stop_claude() {
+  local reason="manual"
+  if [[ "${1:-}" == "--reason" && -n "${2:-}" ]]; then
+    reason="$2"
+  fi
+
+  print -- "[INFO] Secure stop requested ($reason)."
+
+  if desktop_running; then
+    osascript -e 'tell application "Claude" to quit' >/dev/null 2>&1 || true
+
+    local attempt
+    for attempt in {1..20}; do
+      desktop_running || break
+      sleep 0.25
+    done
+
+    if desktop_running; then
+      pkill -TERM -u "$(id -u)" -x Claude >/dev/null 2>&1 || true
+      pkill -TERM -u "$(id -u)" -f '/Applications/Claude\.app/Contents/' >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if cli_running; then
+    pkill -TERM -u "$(id -u)" -x claude >/dev/null 2>&1 || true
+  fi
+
+  sleep 0.2
+  if desktop_running || cli_running; then
+    print -u2 -- "[WARN] A Claude process is still running; it was not force-killed."
+    return 1
+  fi
+
+  print -- "[ OK ] Claude Desktop and the user's exact-name Claude CLI processes are stopped."
+  print -- "[INFO] Cookies, account data, and diagnostic logs were preserved."
+}
+
+show_status() {
+  if desktop_running; then
+    print -- "Claude Desktop: running"
+  else
+    print -- "Claude Desktop: stopped"
+  fi
+
+  if cli_running; then
+    print -- "Claude CLI: running"
+  else
+    print -- "Claude CLI: stopped"
+  fi
+
+  network_check
+}
+
+load_config
+
+case "${1:-help}" in
+  start) start_claude ;;
+  stop) shift; stop_claude "$@" ;;
+  clean) stop_claude --reason manual-clean ;;
+  check) network_check ;;
+  status) show_status ;;
+  help|-h|--help) usage ;;
+  *)
+    print -u2 -- "Unknown command: ${1:-}"
+    usage >&2
+    exit 2
+    ;;
+esac
